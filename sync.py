@@ -17,6 +17,9 @@ from security import resolves_publicly, valid_public_url
 
 
 class SyncEngine:
+    SYNC_ALGORITHM = "vidfast-light-v2"
+    VIDFAST_SAMPLE_RESOLUTIONS = (480, 720, 1080, 1440)
+
     def __init__(self, audio: AudioStore, offsets: OffsetStore, proxy: str = ""):
         self.audio = audio
         self.offsets = offsets
@@ -65,6 +68,33 @@ class SyncEngine:
     async def _video_entries(self, url: str, headers: dict):
         response = await self._get(url, headers)
         return self._playlist(response.text, url)
+
+    async def _vidfast_sample_url(self, url: str, headers: dict,
+                                  duration: float, provider: str) -> str:
+        """Use a lighter Vidfast rendition for sync when its timeline matches."""
+        if provider != "vidfast":
+            return url
+        match = re.search(r"index-s(\d+)p", url, re.IGNORECASE)
+        if not match:
+            return url
+        current_resolution = int(match.group(1))
+        for resolution in self.VIDFAST_SAMPLE_RESOLUTIONS:
+            if resolution >= current_resolution:
+                break
+            candidate = re.sub(
+                r"index-s\d+p", f"index-s{resolution}p", url,
+                count=1, flags=re.IGNORECASE,
+            )
+            try:
+                entries, _ = await self._video_entries(candidate, headers)
+            except Exception as error:
+                print(f"[sidecar sync] Vidfast {resolution}p unavailable: {type(error).__name__}")
+                continue
+            candidate_duration = sum(item["duration"] for item in entries)
+            if abs(candidate_duration - duration) <= 1.0:
+                print(f"[sidecar sync] Vidfast sync rendition: {resolution}p")
+                return candidate
+        return url
 
     async def _download(self, url: str, path: Path, headers: dict):
         response = await self._get(url, headers)
@@ -231,6 +261,7 @@ class SyncEngine:
     async def measure(self, payload: dict):
         media_key = str(payload.get("media_key") or "")
         resolution = int(payload.get("resolution") or 0)
+        provider = str(payload.get("provider") or "").strip().lower()
         video_url = str(payload.get("video_url") or "")
         video_headers = payload.get("video_headers") if isinstance(payload.get("video_headers"), dict) else {}
         reference_audio_url = str(
@@ -242,8 +273,30 @@ class SyncEngine:
         audio_fp = str(payload.get("audio_fingerprint") or metadata.get("source_fingerprint") or "")
         cache_key = self.offsets.key(media_key, resolution, video_fp, audio_fp)
         payload["cache_key"] = cache_key
-        lookup = await self.offsets.lookup({"cache_key": cache_key, "media_key": media_key, "resolution": resolution, "video_fingerprint": video_fp, "audio_fingerprint": audio_fp, "vpsAccess": payload.get("vpsAccess", "")})
-        if lookup:
+        lookup = await self.offsets.lookup({
+            "cache_key": cache_key,
+            "media_key": media_key,
+            "resolution": resolution,
+            "video_fingerprint": video_fp,
+            "audio_fingerprint": audio_fp,
+            "vpsAccess": payload.get("vpsAccess", ""),
+            "vpsHost": payload.get("vpsHost", ""),
+            "video_url": video_url,
+            "provider": payload.get("provider", ""),
+            "server": payload.get("server", ""),
+        })
+        lookup_details = lookup.get("details") if isinstance(lookup, dict) else {}
+        lookup_status = str(
+            (lookup.get("status") if isinstance(lookup, dict) else "")
+            or (lookup_details.get("status") if isinstance(lookup_details, dict) else "")
+        ).strip().lower()
+        retry_old_vidfast = (
+            provider == "vidfast"
+            and lookup_status == "incompatible"
+            and (lookup_details.get("sync_algorithm") if isinstance(lookup_details, dict) else "")
+            != self.SYNC_ALGORITHM
+        )
+        if lookup and not retry_old_vidfast:
             result = {"status": "ok", "cached": True, **(lookup.get("details") or lookup)}
             if reference_audio_url and not result.get("video_start_time"):
                 lookup = None
@@ -252,6 +305,9 @@ class SyncEngine:
                 return result
         video_entries, _ = await self._video_entries(video_url, video_headers)
         video_duration = sum(item["duration"] for item in video_entries)
+        sample_video_url = await self._vidfast_sample_url(
+            video_url, video_headers, video_duration, provider
+        )
         video_start_time = 0.0
         if reference_audio_url:
             video_start_time = await self._media_start_time(video_url, video_headers)
@@ -278,7 +334,7 @@ class SyncEngine:
                     )
                 else:
                     reference_playlist, reference_seek, _ = await self._decode_video(
-                        video_url, video_headers, position, video_dir
+                        sample_video_url, video_headers, position, video_dir
                     )
                 audio_playlist, audio_seek, _ = await self._decode_audio(audio_hid, position, audio_dir)
                 video_pcm, audio_pcm = root / f"video-{index}.pcm", root / f"audio-{index}.pcm"
@@ -292,7 +348,8 @@ class SyncEngine:
                     raise RuntimeError(f"{type(failure).__name__}: {str(failure)[:260]}")
                 lag, correlation = self._lag(self._envelope(video_pcm), self._envelope(audio_pcm))
                 measurements.append({"position": position, "lag": lag, "offset": lag, "correlation": correlation})
-        valid = [item for item in measurements if item["correlation"] >= .75]
+        correlation_floor = .70 if provider == "vidfast" else .75
+        valid = [item for item in measurements if item["correlation"] >= correlation_floor]
         if len(valid) < 2:
             result = {"status": "incompatible", "video_duration": video_duration, "audio_duration": audio_duration, "measurements": measurements}
         else:
@@ -301,5 +358,6 @@ class SyncEngine:
             result = {"status": "ok" if deviation <= .25 else "incompatible", "offset": round(-measured + video_start_time, 3), "rate": 1.0, "confidence": min(item["correlation"] for item in valid), "deviation": deviation, "sync_mode": "constant", "video_duration": video_duration, "audio_duration": audio_duration, "measurements": measurements}
             if reference_audio_url:
                 result["video_start_time"] = round(video_start_time, 3)
+        result["sync_algorithm"] = self.SYNC_ALGORITHM
         result["cache_key"] = cache_key
         return result
