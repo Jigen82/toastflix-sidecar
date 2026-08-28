@@ -199,4 +199,12 @@ async def sync_audio(request: Request):
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     await offsets.report(body, result)
+    if result.get("status") != "ok":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "EDITIONS_DIFFERENT",
+                "message": "Edizioni audio e video differenti: sincronizzazione affidabile impossibile.",
+            },
+        )
     return result
