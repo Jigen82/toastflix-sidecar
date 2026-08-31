@@ -2,5 +2,6 @@ services:
   - type: web
     name: sidecar
     runtime: image
+    plan: free
     image:
       url: ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
