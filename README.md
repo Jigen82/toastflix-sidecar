@@ -1,5 +1,7 @@
 # ToastFlix Audio Sidecar
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
 Questo servizio gestisce solo l'audio del DUAL ToastFlix.
 
 - Il video continua a passare dal proxy locale di Stremio.
