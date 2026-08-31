@@ -4,7 +4,3 @@ services:
     runtime: image
     image:
       url: ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
-    plan: free
-    envVars:
-      - key: PORT
-        value: 8080
