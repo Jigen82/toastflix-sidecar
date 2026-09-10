@@ -74,9 +74,7 @@ class SyncEngine:
 
     async def _vidfast_sample_url(self, url: str, headers: dict,
                                   duration: float, provider: str) -> str:
-        """Use a lighter Vidfast rendition (480p) for sync when its timeline matches."""
-        if provider != "vidfast":
-            return url
+        """Use a lighter rendition (480p) for sync when its timeline matches."""
         match = re.search(r"index-s(\d+)p", url, re.IGNORECASE)
         if not match:
             return url
@@ -440,11 +438,11 @@ class SyncEngine:
         if common < 90:
             raise ValueError("media too short")
 
-        # Fast Pass: 20% @ 5s, 40% @ 7s, 80% @ 5s
+        # Fast Pass: 3 points @ 5s each
         fast_points = [
             (round(common * 0.2, 3), 5.0),
-            (round(common * 0.4, 3), 7.0),
-            (round(common * 0.8, 3), 5.0),
+            (round(common * 0.4, 3), 5.0),
+            (round(common * 0.7, 3), 5.0),
         ]
         fallback_positions = sorted({
             min(60.0, common * 0.1),
@@ -493,7 +491,7 @@ class SyncEngine:
                     measurements.append(res)
 
             fast_valid = [item for item in measurements if item["correlation"] >= correlation_floor]
-            if len(fast_valid) >= 3:
+            if len(fast_valid) >= 2:
                 measured = statistics.median(item["offset"] for item in fast_valid)
                 deviation = max(abs(item["offset"] - measured) for item in fast_valid)
                 if deviation <= self.SYNC_MAX_DEVIATION:
