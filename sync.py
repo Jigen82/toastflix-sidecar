@@ -17,14 +17,18 @@ from security import resolves_publicly, valid_public_url
 
 
 class SyncEngine:
-    SYNC_ALGORITHM = "vidfast-light-v2"
+    SYNC_ALGORITHM = "fastpass-vidfast-v3"
     VIDFAST_SAMPLE_RESOLUTIONS = (480, 720, 1080, 1440)
+    SYNC_MAX_DEVIATION = 0.25
+    SYNC_MAX_RATE_DELTA = 0.002
+    SYNC_MAX_LINEAR_DEVIATION = 0.15
+    SYNC_MAX_END_DEVIATION = 2.0
 
     def __init__(self, audio: AudioStore, offsets: OffsetStore, proxy: str = ""):
         self.audio = audio
         self.offsets = offsets
         self.proxy = proxy
-        self.sample_seconds = 20
+        self.sample_seconds = 5
 
     async def _get(self, url: str, headers: dict):
         if not valid_public_url(url) or not await resolves_publicly(url):
@@ -52,7 +56,6 @@ class SyncEngine:
         for raw in text.splitlines():
             line = raw.strip()
             if line.startswith("#EXT-X-MAP:"):
-                import re
                 match = re.search(r'URI="([^"]+)"', line)
                 map_url = urljoin(master_url, match.group(1)) if match else None
             elif line.startswith("#EXTINF:"):
@@ -71,7 +74,7 @@ class SyncEngine:
 
     async def _vidfast_sample_url(self, url: str, headers: dict,
                                   duration: float, provider: str) -> str:
-        """Use a lighter Vidfast rendition for sync when its timeline matches."""
+        """Use a lighter Vidfast rendition (480p) for sync when its timeline matches."""
         if provider != "vidfast":
             return url
         match = re.search(r"index-s(\d+)p", url, re.IGNORECASE)
@@ -92,7 +95,7 @@ class SyncEngine:
                 continue
             candidate_duration = sum(item["duration"] for item in entries)
             if abs(candidate_duration - duration) <= 1.0:
-                print(f"[sidecar sync] Vidfast sync rendition: {resolution}p")
+                print(f"[sidecar sync] Vidfast sync rendition downsampled to: {resolution}p")
                 return candidate
         return url
 
@@ -101,7 +104,7 @@ class SyncEngine:
         path.write_bytes(response.content)
 
     @staticmethod
-    def _sample_entries(entries, position: float):
+    def _sample_entries(entries, position: float, sample_seconds: float = 5.0):
         target = next((i for i, item in enumerate(entries)
                        if item["start"] <= position < item["start"] + item["duration"]),
                       len(entries) - 1)
@@ -111,13 +114,13 @@ class SyncEngine:
         for item in entries[first:]:
             selected.append(item)
             available += item["duration"]
-            if available >= local_seek + 25.0:
+            if available >= local_seek + sample_seconds + 5.0:
                 break
         return selected, local_seek, sum(item["duration"] for item in entries)
 
-    async def _decode_video(self, url: str, headers: dict, position: float, directory: Path):
+    async def _decode_video(self, url: str, headers: dict, position: float, directory: Path, sample_seconds: float = 5.0):
         _, entries, map_url = (url, *await self._video_entries(url, headers))
-        selected, local_seek, duration = self._sample_entries(entries, position)
+        selected, local_seek, duration = self._sample_entries(entries, position, sample_seconds)
         lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-PLAYLIST-TYPE:VOD", f"#EXT-X-TARGETDURATION:{int(max(x['duration'] for x in selected)) + 1}"]
         if map_url:
             await self._download(map_url, directory / "video-init.mp4", headers)
@@ -131,10 +134,10 @@ class SyncEngine:
         playlist.write_text("\n".join(lines) + "\n")
         return playlist, local_seek, duration
 
-    async def _decode_reference_audio(self, url: str, headers: dict, position: float, directory: Path):
+    async def _decode_reference_audio(self, url: str, headers: dict, position: float, directory: Path, sample_seconds: float = 5.0):
         response = await self._get(url, headers)
         entries, map_url = self._playlist(response.text, url)
-        selected, local_seek, duration = self._sample_entries(entries, position)
+        selected, local_seek, duration = self._sample_entries(entries, position, sample_seconds)
         lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-PLAYLIST-TYPE:VOD",
                  f"#EXT-X-TARGETDURATION:{int(max(item['duration'] for item in selected)) + 1}"]
         key_line = next((line.strip() for line in response.text.splitlines()
@@ -185,12 +188,17 @@ class SyncEngine:
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    async def _decode_audio(self, hid: str, position: float, directory: Path):
+    async def _decode_audio(self, hid: str, position: float, directory: Path, sample_seconds: float = 5.0):
         metadata = self.audio.metadata(hid)
         index = next((i for i, start in enumerate(metadata["starts"]) if start <= position < start + metadata["durs"][i]), len(metadata["segs"]) - 1)
         first = max(0, index - 1)
         local_seek = max(0.0, position - metadata["starts"][first])
-        selected = range(first, min(len(metadata["segs"]), index + 5))
+        needed = 0.0
+        last = first
+        while last < len(metadata["segs"]) and needed < (local_seek + sample_seconds + 5.0):
+            needed += metadata["durs"][last]
+            last += 1
+        selected = range(first, max(first + 1, last))
         iv = f",IV={metadata['iv']}" if metadata.get("iv") else ""
         lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
                  f"#EXT-X-TARGETDURATION:{int(max(metadata['durs'][item] for item in selected)) + 1}",
@@ -206,14 +214,19 @@ class SyncEngine:
         return playlist, local_seek, sum(metadata["durs"])
 
     @staticmethod
-    async def _pcm(playlist: Path, seek: float, output: Path, audio_map: bool = True):
-        command = ["ffmpeg", "-v", "error", "-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto", "-i", str(playlist), "-ss", f"{max(0.0, seek):.3f}", "-t", "20"]
+    async def _pcm(playlist: Path, seek: float, output: Path, audio_map: bool = True, sample_seconds: float = 5.0):
+        command = [
+            "ffmpeg", "-v", "error", "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,crypto", "-i", str(playlist),
+            "-ss", f"{max(0.0, seek):.3f}", "-t", f"{sample_seconds:g}",
+        ]
         if audio_map:
             command += ["-map", "0:a:0", "-vn"]
         command += ["-ac", "1", "-ar", "8000", "-f", "s16le", "-y", str(output)]
         process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, error = await asyncio.wait_for(process.communicate(), timeout=60)
-        if process.returncode or not output.exists() or output.stat().st_size < 160000:
+        min_size = int(sample_seconds * 8000 * 2 * 0.70)
+        if process.returncode or not output.exists() or output.stat().st_size < min_size:
             raise RuntimeError((error.decode(errors="replace") or "sample decode failed")[:300])
 
     @staticmethod
@@ -246,7 +259,7 @@ class SyncEngine:
             else:
                 size = min(len(candidate), len(reference) + lag)
                 left, right = reference[-lag:-lag + size], candidate[:size]
-            if size < 500:
+            if size < min(200, len(reference) // 2):
                 continue
             lm, rm = sum(left) / size, sum(right) / size
             lv = sum((value - lm) ** 2 for value in left)
@@ -257,6 +270,110 @@ class SyncEngine:
                 if correlation > best[0]:
                     best = correlation, lag
         return best[1] / 100.0, best[0]
+
+    def _evaluate_measurements(self, video_duration: float, audio_duration: float,
+                               measurements: list[dict], video_start_time: float = 0.0,
+                               correlation_floor: float = 0.70) -> dict:
+        result = {
+            "status": "incompatible",
+            "video_duration": video_duration,
+            "audio_duration": audio_duration,
+            "measurements": measurements,
+        }
+        valid = [item for item in measurements
+                 if item and float(item.get("correlation") or 0.0) >= correlation_floor]
+        if len(valid) < 2:
+            return result
+
+        # 1. Constant offset evaluation
+        measured = statistics.median(float(item["offset"]) for item in valid)
+        deviation = max(abs(float(item["offset"]) - measured) for item in valid)
+        if deviation <= self.SYNC_MAX_DEVIATION:
+            result.update({
+                "status": "ok",
+                "offset": round(-measured + video_start_time, 3),
+                "rate": 1.0,
+                "sync_mode": "constant",
+                "confidence": min(float(item["correlation"]) for item in valid),
+                "deviation": deviation,
+            })
+            return result
+
+        result["deviation"] = deviation
+
+        # 2. Standard 24.000 vs 23.976 fps linear drift check
+        if len(valid) >= 2:
+            sorted_valid = sorted(valid, key=lambda x: float(x["position"]))
+            t1 = float(sorted_valid[0]["position"])
+            t2 = float(sorted_valid[-1]["position"])
+            dt = t2 - t1
+            if dt >= 1200:  # at least 20 minutes apart
+                o1 = float(sorted_valid[0]["offset"])
+                o2 = float(sorted_valid[-1]["offset"])
+                slope = (o2 - o1) / dt
+                drift_hr = slope * 3600.0
+                std_rate = None
+                if -3.75 <= drift_hr <= -3.45:
+                    std_rate = 1000.0 / 1001.0  # 24.000 -> 23.976 fps
+                elif 3.45 <= drift_hr <= 3.75:
+                    std_rate = 1001.0 / 1000.0  # 23.976 -> 24.000 fps
+
+                if std_rate:
+                    interc = o1 - (std_rate - 1.0) * t1
+                    end_dev = abs(interc + std_rate * video_duration - audio_duration)
+                    if end_dev <= self.SYNC_MAX_END_DEVIATION:
+                        result.update({
+                            "status": "ok",
+                            "offset": round(-interc + video_start_time, 3),
+                            "rate": round(std_rate, 9),
+                            "sync_mode": "linear",
+                            "confidence": min(float(item["correlation"]) for item in valid),
+                            "deviation": abs(drift_hr - (-3.600614 if std_rate < 1.0 else 3.6036)),
+                            "drift_per_hour": drift_hr,
+                            "candidate_rate": std_rate,
+                            "end_deviation": end_dev,
+                        })
+                        return result
+
+        # 3. General linear regression
+        if len(valid) < 3:
+            return result
+
+        positions = [float(item["position"]) for item in valid]
+        offsets = [float(item["offset"]) for item in valid]
+        mean_position = statistics.mean(positions)
+        mean_offset = statistics.mean(offsets)
+        denominator = sum((position - mean_position) ** 2 for position in positions)
+        if denominator <= 0 or max(positions) - min(positions) < 60.0:
+            return result
+
+        slope = sum((position - mean_position) * (offset - mean_offset)
+                    for position, offset in zip(positions, offsets)) / denominator
+        intercept = mean_offset - slope * mean_position
+        rate = 1.0 + slope
+        linear_deviation = max(abs(offset - (intercept + slope * position))
+                               for position, offset in zip(positions, offsets))
+        end_deviation = abs(intercept + rate * video_duration - audio_duration)
+        result.update({
+            "candidate_rate": rate,
+            "linear_deviation": linear_deviation,
+            "drift_per_hour": slope * 3600.0,
+            "end_deviation": end_deviation,
+        })
+        if (abs(rate - 1.0) > self.SYNC_MAX_RATE_DELTA
+                or linear_deviation > self.SYNC_MAX_LINEAR_DEVIATION
+                or end_deviation > self.SYNC_MAX_END_DEVIATION):
+            return result
+
+        result.update({
+            "status": "ok",
+            "offset": round(-intercept + video_start_time, 3),
+            "rate": round(rate, 9),
+            "sync_mode": "linear",
+            "confidence": min(float(item["correlation"]) for item in valid),
+            "deviation": linear_deviation,
+        })
+        return result
 
     async def measure(self, payload: dict):
         media_key = str(payload.get("media_key") or "")
@@ -303,6 +420,7 @@ class SyncEngine:
             else:
                 result["cache_key"] = cache_key
                 return result
+
         video_entries, _ = await self._video_entries(video_url, video_headers)
         video_duration = sum(item["duration"] for item in video_entries)
         sample_video_url = await self._vidfast_sample_url(
@@ -321,43 +439,101 @@ class SyncEngine:
         common = min(video_duration, reference_duration, audio_duration)
         if common < 90:
             raise ValueError("media too short")
-        positions = sorted({min(60.0, common * .1), common * .5, max(30.0, common - 90.0)})
+
+        # Fast Pass: 20% @ 5s, 40% @ 7s, 80% @ 5s
+        fast_points = [
+            (round(common * 0.2, 3), 5.0),
+            (round(common * 0.4, 3), 7.0),
+            (round(common * 0.8, 3), 5.0),
+        ]
+        fallback_positions = sorted({
+            min(60.0, common * 0.1),
+            round(common * 0.6, 3),
+            max(30.0, common - 90.0),
+        })
+
+        correlation_floor = 0.70
         measurements = []
         with tempfile.TemporaryDirectory(prefix="sidecar-sync-") as directory:
             root = Path(directory)
-            for index, position in enumerate(positions):
+
+            async def _sample_point(position: float, duration: float, index: int) -> dict:
                 video_dir, audio_dir = root / f"video-{index}", root / f"audio-{index}"
-                video_dir.mkdir(), audio_dir.mkdir()
+                video_dir.mkdir(exist_ok=True)
+                audio_dir.mkdir(exist_ok=True)
                 if reference_audio_url:
                     reference_playlist, reference_seek, _ = await self._decode_reference_audio(
-                        reference_audio_url, video_headers, position, video_dir
+                        reference_audio_url, video_headers, position, video_dir, sample_seconds=duration
                     )
                 else:
                     reference_playlist, reference_seek, _ = await self._decode_video(
-                        sample_video_url, video_headers, position, video_dir
+                        sample_video_url, video_headers, position, video_dir, sample_seconds=duration
                     )
-                audio_playlist, audio_seek, _ = await self._decode_audio(audio_hid, position, audio_dir)
+                audio_playlist, audio_seek, _ = await self._decode_audio(
+                    audio_hid, position, audio_dir, sample_seconds=duration
+                )
                 video_pcm, audio_pcm = root / f"video-{index}.pcm", root / f"audio-{index}.pcm"
                 samples = await asyncio.gather(
-                    self._pcm(reference_playlist, reference_seek, video_pcm),
-                    self._pcm(audio_playlist, audio_seek, audio_pcm),
+                    self._pcm(reference_playlist, reference_seek, video_pcm, sample_seconds=duration),
+                    self._pcm(audio_playlist, audio_seek, audio_pcm, sample_seconds=duration),
                     return_exceptions=True,
                 )
                 failure = next((sample for sample in samples if isinstance(sample, BaseException)), None)
                 if failure is not None:
                     raise RuntimeError(f"{type(failure).__name__}: {str(failure)[:260]}")
                 lag, correlation = self._lag(self._envelope(video_pcm), self._envelope(audio_pcm))
-                measurements.append({"position": position, "lag": lag, "offset": lag, "correlation": correlation})
-        correlation_floor = .70 if provider == "vidfast" else .75
-        valid = [item for item in measurements if item["correlation"] >= correlation_floor]
-        if len(valid) < 2:
-            result = {"status": "incompatible", "video_duration": video_duration, "audio_duration": audio_duration, "measurements": measurements}
-        else:
-            measured = statistics.median(item["offset"] for item in valid)
-            deviation = max(abs(item["offset"] - measured) for item in valid)
-            result = {"status": "ok" if deviation <= .25 else "incompatible", "offset": round(-measured + video_start_time, 3), "rate": 1.0, "confidence": min(item["correlation"] for item in valid), "deviation": deviation, "sync_mode": "constant", "video_duration": video_duration, "audio_duration": audio_duration, "measurements": measurements}
-            if reference_audio_url:
-                result["video_start_time"] = round(video_start_time, 3)
+                return {"position": position, "lag": lag, "offset": lag, "correlation": correlation, "duration": duration}
+
+            # Phase 1: Fast Pass (5s / 7s / 5s)
+            fast_results = await asyncio.gather(*(
+                _sample_point(pos, dur, i) for i, (pos, dur) in enumerate(fast_points)
+            ), return_exceptions=True)
+            for res in fast_results:
+                if not isinstance(res, BaseException):
+                    measurements.append(res)
+
+            fast_valid = [item for item in measurements if item["correlation"] >= correlation_floor]
+            if len(fast_valid) >= 3:
+                measured = statistics.median(item["offset"] for item in fast_valid)
+                deviation = max(abs(item["offset"] - measured) for item in fast_valid)
+                if deviation <= self.SYNC_MAX_DEVIATION:
+                    result = {
+                        "status": "ok",
+                        "offset": round(-measured + video_start_time, 3),
+                        "rate": 1.0,
+                        "confidence": min(item["correlation"] for item in fast_valid),
+                        "deviation": deviation,
+                        "sync_mode": "fast",
+                        "video_duration": video_duration,
+                        "audio_duration": audio_duration,
+                        "measurements": measurements,
+                    }
+                    if reference_audio_url:
+                        result["video_start_time"] = round(video_start_time, 3)
+                    result["sync_algorithm"] = self.SYNC_ALGORITHM
+                    result["cache_key"] = cache_key
+                    return result
+
+            # Phase 2: Fallback positions (5.0s each) if Fast Pass did not have low deviation
+            additional_positions = [
+                pos for pos in fallback_positions
+                if not any(abs(pos - m["position"]) < 30.0 for m in measurements)
+            ]
+            start_idx = len(measurements)
+            add_results = await asyncio.gather(*(
+                _sample_point(pos, 5.0, start_idx + i) for i, pos in enumerate(additional_positions)
+            ), return_exceptions=True)
+            for res in add_results:
+                if not isinstance(res, BaseException):
+                    measurements.append(res)
+
+        result = self._evaluate_measurements(
+            video_duration, audio_duration, measurements,
+            video_start_time=video_start_time,
+            correlation_floor=correlation_floor,
+        )
+        if reference_audio_url and result.get("status") == "ok":
+            result["video_start_time"] = round(video_start_time, 3)
         result["sync_algorithm"] = self.SYNC_ALGORITHM
         result["cache_key"] = cache_key
         return result
